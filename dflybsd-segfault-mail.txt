@@ -1,0 +1,784 @@
+$ cat segfault.txt
+(gdb) p *(parse_addrs::ps)
+$8 = {addr = "asdad", '\000' <repeats 994 times>, pos = 0, state = QUIT, comment = 0,
+  quote = 0, brackets = 0, esc = 0, hdr = {from_addr = '\000' <repeats 999 times>,
+    from_line = '\000' <repeats 9999 times>}, add_addr_func = 0x0}
+
+$ cat mail.c
+/*
+ * Copyright (c) 2008-2014, Simon Schubert <2@0x2c.org>.
+ * Copyright (c) 2008 The DragonFly Project.  All rights reserved.
+ *
+ * This code is derived from software contributed to The DragonFly Project
+ * by Simon Schubert <2@0x2c.org>.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name of The DragonFly Project nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific, prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
+ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+#include <errno.h>
+#include <inttypes.h>
+#include <signal.h>
+#include <strings.h>
+#include <string.h>
+#include <syslog.h>
+#include <unistd.h>
+
+#include "dma.h"
+
+void
+bounce(struct qitem *it, const char *reason)
+{
+	struct queue bounceq;
+	char line[1000];
+	size_t pos;
+	int error;
+
+	/* Don't bounce bounced mails */
+	if (it->sender[0] == 0) {
+		syslog(LOG_INFO, "can not bounce a bounce message, discarding");
+		exit(EX_SOFTWARE);
+	}
+
+	bzero(&bounceq, sizeof(bounceq));
+	LIST_INIT(&bounceq.queue);
+	bounceq.sender = "";
+	if (add_recp(NULL, &bounceq, it->sender, EXPAND_WILDCARD) != 0)
+		goto fail;
+
+	if (newspoolf(&bounceq) != 0)
+		goto fail;
+
+	syslog(LOG_ERR, "delivery failed, bouncing as %s", bounceq.id);
+	setlogident("%s", bounceq.id);
+
+	error = fprintf(bounceq.mailf,
+		"Received: from MAILER-DAEMON\n"
+		"\tid %s\n"
+		"\tby %s (%s);\n"
+		"\t%s\n"
+		"X-Original-To: <%s>\n"
+		"From: MAILER-DAEMON <>\n"
+		"To: %s\n"
+		"Subject: Mail delivery failed\n"
+		"Message-Id: <%s@%s>\n"
+		"Date: %s\n"
+		"\n"
+		"This is the %s at %s.\n"
+		"\n"
+		"There was an error delivering your mail to <%s>.\n"
+		"\n"
+		"%s\n"
+		"\n"
+		"%s\n"
+		"\n",
+		bounceq.id,
+		hostname(), VERSION,
+		rfc822date(),
+		it->addr,
+		it->sender,
+		bounceq.id, hostname(),
+		rfc822date(),
+		VERSION, hostname(),
+		it->addr,
+		reason,
+		config.features & FULLBOUNCE ?
+		    "Original message follows." :
+		    "Message headers follow.");
+	if (error < 0)
+		goto fail;
+
+	if (fseek(it->mailf, 0, SEEK_SET) != 0)
+		goto fail;
+	if (config.features & FULLBOUNCE) {
+		while ((pos = fread(line, 1, sizeof(line), it->mailf)) > 0) {
+			if (fwrite(line, 1, pos, bounceq.mailf) != pos)
+				goto fail;
+		}
+	} else {
+		while (!feof(it->mailf)) {
+			if (fgets(line, sizeof(line), it->mailf) == NULL)
+				break;
+			if (line[0] == '\n')
+				break;
+			if (fwrite(line, strlen(line), 1, bounceq.mailf) != 1)
+				goto fail;
+		}
+	}
+
+	if (linkspool(&bounceq) != 0)
+		goto fail;
+	/* bounce is safe */
+
+	delqueue(it);
+
+	run_queue(&bounceq);
+	/* NOTREACHED */
+
+fail:
+	syslog(LOG_CRIT, "error creating bounce: %m");
+	delqueue(it);
+	exit(EX_IOERR);
+}
+
+typedef int (*add_addr_funcptr)(struct msg_hdr *hdr, struct queue *queue, const char *str, int expand);
+
+struct parse_state {
+	char addr[MSG_LINE_MAX];
+	int pos;
+
+	enum {
+		NONE = 0,
+		START,
+		MAIN,
+		EOL,
+		QUIT
+	} state;
+	int comment;
+	int quote;
+	int brackets;
+	int esc;
+
+	struct msg_hdr hdr;
+	add_addr_funcptr add_addr_func;
+};
+
+int
+add_header_from_addr(struct msg_hdr *hdr, struct queue *queue, const char *str, int expand)
+{
+	
+	strcpy(hdr->from_addr, str);
+	return (0);
+}
+
+/*
+ * Simplified RFC2822 header/address parsing.
+ * We copy escapes and quoted strings directly, since
+ * we have to pass them like this to the mail server anyways.
+ * XXX local addresses will need treatment
+ */
+static int
+parse_addrs(struct parse_state *ps, char *s, struct queue *queue)
+{
+	char *addr;
+
+again:
+	switch (ps->state) {
+	case NONE:
+		return (-1);
+
+	case START:
+		/* init our data */
+		bzero(ps, sizeof(*ps));
+
+		/* skip over header name */
+		while (*s != ':')
+			s++;
+		s++;
+		ps->state = MAIN;
+		break;
+
+	case MAIN:
+		/* all fine */
+		break;
+
+	case EOL:
+		switch (*s) {
+		case ' ':
+		case '\t':
+			ps->state = MAIN;
+			break;
+
+		default:
+			ps->state = QUIT;
+			if (ps->pos != 0)
+				goto newaddr;
+			return (0);
+		}
+		break;
+
+	case QUIT:
+		return (0);
+	}
+
+	for (; *s != 0; s++) {
+		if (ps->esc) {
+			ps->esc = 0;
+
+			switch (*s) {
+			case '\r':
+			case '\n':
+				goto err;
+
+			default:
+				goto copy;
+			}
+		}
+
+		if (ps->quote) {
+			switch (*s) {
+			case '"':
+				ps->quote = 0;
+				goto copy;
+
+			case '\\':
+				ps->esc = 1;
+				goto copy;
+
+			case '\r':
+			case '\n':
+				goto eol;
+
+			default:
+				goto copy;
+			}
+		}
+
+		switch (*s) {
+		case '(':
+			ps->comment++;
+			break;
+
+		case ')':
+			if (ps->comment)
+				ps->comment--;
+			else
+				goto err;
+			goto skip;
+
+		case '"':
+			ps->quote = 1;
+			goto copy;
+
+		case '\\':
+			ps->esc = 1;
+			goto copy;
+
+		case '\r':
+		case '\n':
+			goto eol;
+		}
+
+		if (ps->comment)
+			goto skip;
+
+		switch (*s) {
+		case ' ':
+		case '\t':
+			/* ignore whitespace */
+			goto skip;
+
+		case '<':
+			/* this is the real address now */
+			ps->brackets = 1;
+			ps->pos = 0;
+			goto skip;
+
+		case '>':
+			if (!ps->brackets)
+				goto err;
+			ps->brackets = 0;
+
+			s++;
+			goto newaddr;
+
+		case ':':
+			/* group - ignore */
+			ps->pos = 0;
+			goto skip;
+
+		case ',':
+		case ';':
+			/*
+			 * Next address, copy previous one.
+			 * However, we might be directly after
+			 * a <address>, or have two consecutive
+			 * commas.
+			 * Skip the comma unless there is
+			 * really something to copy.
+			 */
+			if (ps->pos == 0)
+				goto skip;
+			s++;
+			goto newaddr;
+
+		default:
+			goto copy;
+		}
+
+copy:
+		if (ps->comment)
+			goto skip;
+
+		if (ps->pos + 1 == sizeof(ps->addr))
+			goto err;
+		ps->addr[ps->pos++] = *s;
+
+skip:
+		;
+	}
+
+eol:
+	ps->state = EOL;
+	return (0);
+
+err:
+	ps->state = QUIT;
+	return (-1);
+
+newaddr:
+	ps->addr[ps->pos] = 0;
+	ps->pos = 0;
+	addr = strdup(ps->addr);
+	if (addr == NULL)
+		errlog(EX_SOFTWARE, NULL);
+
+//	if (add_recp(queue, addr, EXPAND_WILDCARD) != 0)
+	if (ps->add_addr_func(&ps->hdr, queue, addr, EXPAND_WILDCARD) != 0)
+		errlogx(EX_DATAERR, "invalid address `%s'", addr);
+
+	goto again;
+}
+
+int
+readmail(struct queue *queue, int nodot, int recp_from_header)
+{
+	struct parse_state parse_state;
+	char line[MSG_LINE_MAX];
+	size_t linelen;
+	size_t error;
+	int had_headers = 0;
+	int had_from = 0;
+	int had_messagid = 0;
+	int had_date = 0;
+	int had_first_line = 0;
+	int had_last_line = 0;
+	int nocopy = 0;
+	int rewrite_from = 1;
+
+	parse_state.state = NONE;
+
+	error = fprintf(queue->mailf,
+		"Received: from %s (uid %d)\n"
+		"\t(envelope-from %s)\n"
+		"\tid %s\n"
+		"\tby %s (%s);\n"
+		"\t%s\n",
+		username, useruid,
+		queue->sender,
+		queue->id,
+		hostname(), VERSION,
+		rfc822date());
+	if ((ssize_t)error < 0)
+		return (-1);
+
+	while (!feof(stdin)) {
+		if (fgets(line, sizeof(line) - 1, stdin) == NULL)
+			break;
+		if (had_last_line)
+			errlogx(EX_DATAERR, "bad mail input format:"
+				" from %s (uid %d) (envelope-from %s)",
+				username, useruid, queue->sender);
+		linelen = strlen(line);
+		if (linelen == 0 || line[linelen - 1] != '\n') {
+			/*
+			 * This line did not end with a newline character.
+			 * If we fix it, it better be the last line of
+			 * the file.
+			 */
+			line[linelen] = '\n';
+			line[linelen + 1] = 0;
+			had_last_line = 1;
+		}
+		if (!had_first_line) {
+			/*
+			 * Ignore a leading RFC-976 From_ or >From_ line mistakenly
+			 * inserted by some programs.
+			 */
+			if (strprefixcmp(line, "From ") == 0 || strprefixcmp(line, ">From ") == 0)
+				continue;
+			had_first_line = 1;
+		}
+		if (!had_headers) {
+			/*
+			 * Unless this is a continuation, switch off
+			 * the nocopy flag.
+			 */
+			if (!(line[0] == ' ' || line[0] == '\t'))
+				nocopy = 0;
+
+			if (strprefixcmp(line, "Date:") == 0)
+				had_date = 1;
+			else if (strprefixcmp(line, "Message-Id:") == 0)
+				had_messagid = 1;
+			else if (strprefixcmp(line, "From:") == 0) {
+				had_from = 1;
+				/* do not copy From, we'll add it later */
+				if (rewrite_from)
+					nocopy = 1;
+			}
+			else if (strprefixcmp(line, "Bcc:") == 0)
+				nocopy = 1;
+
+			if (parse_state.state != NONE) {
+				if (parse_state.add_addr_func == &add_header_from_addr) {
+					if ((strlen(parse_state.hdr.from_line)+linelen+1) > MSG_HDR_FROM_MAX)
+						errlogx(EX_DATAERR, "header From too long\n");
+					strcat(parse_state.hdr.from_line, line);
+				}
+				if (parse_addrs(&parse_state, line, queue) < 0) {
+					errlogx(EX_DATAERR, "invalid address in header\n");
+					/* NOTREACHED */
+				}
+			}
+
+			if (recp_from_header && (
+					strprefixcmp(line, "To:") == 0 ||
+					strprefixcmp(line, "Cc:") == 0 ||
+					strprefixcmp(line, "Bcc:") == 0)) {
+				parse_state.state = START;
+				parse_state.add_addr_func = &add_recp;
+				if (parse_addrs(&parse_state, line, queue) < 0) {
+					errlogx(EX_DATAERR, "invalid recipient in header\n");
+					/* NOTREACHED */
+				}
+			}
+
+			if (strprefixcmp(line, "From:") == 0) {
+				strcpy(parse_state.hdr.from_line, line);
+				parse_state.state = START;
+				parse_state.add_addr_func = &add_header_from_addr;
+				if (parse_addrs(&parse_state, line, queue) < 0) {
+					errlogx(EX_DATAERR, "invalid From in header\n");
+					/* NOTREACHED */
+				}
+
+			}
+
+		}
+
+		if (strcmp(line, "\n") == 0 && !had_headers) {
+			had_headers = 1;
+			while (!had_date || !had_messagid || !had_from || rewrite_from) {
+				if (!had_date) {
+					had_date = 1;
+					snprintf(line, sizeof(line), "Date: %s\n", rfc822date());
+				} else if (!had_messagid) {
+					/* XXX msgid, assign earlier and log? */
+					had_messagid = 1;
+					snprintf(line, sizeof(line), "Message-Id: <%"PRIxMAX".%s.%"PRIxMAX"@%s>\n",
+						 (uintmax_t)time(NULL),
+						 queue->id,
+						 (uintmax_t)random(),
+						 hostname());
+				} else if (!had_from) {
+					had_from = 1;
+					rewrite_from = 0;
+					snprintf(line, sizeof(line), "From: <%s>\n", queue->sender);
+				} else if (rewrite_from) {
+					rewrite_from = 0;
+					// TODO rewrite here
+					snprintf(line, sizeof(line), "From: <%s>\n", parse_state.hdr.from_addr);
+				}
+				if (fwrite(line, strlen(line), 1, queue->mailf) != 1)
+					return (-1);
+			}
+			strcpy(line, "\n");
+		}
+		if (!nodot && linelen == 2 && line[0] == '.')
+			break;
+		if (!nocopy) {
+			if (fwrite(line, strlen(line), 1, queue->mailf) != 1)
+				return (-1);
+		}
+	}
+
+	return (0);
+}
+
+$ cat dma.h
+/*
+ * Copyright (c) 2008-2014, Simon Schubert <2@0x2c.org>.
+ * Copyright (c) 2008 The DragonFly Project.  All rights reserved.
+ *
+ * This code is derived from software contributed to The DragonFly Project
+ * by Simon Schubert <2@0x2c.org> and
+ * Matthias Schmidt <matthias@dragonflybsd.org>.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name of The DragonFly Project nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific, prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
+ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+#ifndef DMA_H
+#define DMA_H
+
+#include <sys/types.h>
+#include <sys/queue.h>
+#include <sys/socket.h>
+#include <arpa/nameser.h>
+#include <arpa/inet.h>
+#include <openssl/ssl.h>
+#include <netdb.h>
+#include <sysexits.h>
+
+#define VERSION	"DragonFly Mail Agent " DMA_VERSION
+
+#define BUF_SIZE	2048
+#define ERRMSG_SIZE	1024
+#define USERNAME_SIZE	50
+#define EHLO_RESPONSE_SIZE BUF_SIZE
+#define MSG_LINE_MAX	1000		/* maximum line length in a message, by RFC2822 */
+#define MSG_HDR_FROM_MAX	10*MSG_LINE_MAX /* maximum size of "From" header */
+#define MIN_RETRY	300		/* 5 minutes */
+#define MAX_RETRY	(3*60*60)	/* retry at least every 3 hours */
+#define MAX_TIMEOUT	(5*24*60*60)	/* give up after 5 days */
+#define SLEEP_TIMEOUT	30		/* check for queue flush every 30 seconds */
+#ifndef PATH_MAX
+#define PATH_MAX	1024		/* Max path len */
+#endif
+#define	SMTP_PORT	25		/* Default SMTP port */
+#define CON_TIMEOUT	(5*60)		/* Connection timeout per RFC5321 */
+
+#define STARTTLS	0x002		/* StartTLS support */
+#define SECURETRANSFER	0x004		/* SSL/TLS in general */
+#define NOSSL		0x008		/* Do not use SSL */
+#define DEFER		0x010		/* Defer mails */
+#define INSECURE	0x020		/* Allow plain login w/o encryption */
+#define FULLBOUNCE	0x040		/* Bounce the full message */
+#define TLS_OPP		0x080		/* Opportunistic STARTTLS */
+#define NULLCLIENT	0x100		/* Nullclient support */
+
+#ifndef CONF_PATH
+#error Please define CONF_PATH
+#endif
+
+#ifndef LIBEXEC_PATH
+#error Please define LIBEXEC_PATH
+#endif
+
+#define SPOOL_FLUSHFILE	"flush"
+
+#ifndef DMA_ROOT_USER
+#define DMA_ROOT_USER	"mail"
+#endif
+#ifndef DMA_GROUP
+#define DMA_GROUP	"mail"
+#endif
+
+#ifndef MBOX_STRICT
+#define MBOX_STRICT	0
+#endif
+
+
+struct stritem {
+	SLIST_ENTRY(stritem) next;
+	char *str;
+};
+SLIST_HEAD(strlist, stritem);
+
+struct alias {
+	LIST_ENTRY(alias) next;
+	char *alias;
+	struct strlist dests;
+};
+LIST_HEAD(aliases, alias);
+
+struct qitem {
+	LIST_ENTRY(qitem) next;
+	const char *sender;
+	char *addr;
+	char *queuefn;
+	char *mailfn;
+	char *queueid;
+	FILE *queuef;
+	FILE *mailf;
+	int remote;
+};
+LIST_HEAD(queueh, qitem);
+
+struct queue {
+	struct queueh queue;
+	char *id;
+	FILE *mailf;
+	char *tmpf;
+	const char *sender;
+};
+
+struct config {
+	const char *smarthost;
+	int port;
+	const char *aliases;
+	const char *spooldir;
+	const char *authpath;
+	const char *certfile;
+	int features;
+	const char *mailname;
+	const char *masquerade_host;
+	const char *masquerade_user;
+	const unsigned char *fingerprint;
+
+	/* XXX does not belong into config */
+	SSL *ssl;
+};
+
+
+struct authuser {
+	SLIST_ENTRY(authuser) next;
+	char *login;
+	char *password;
+	char *host;
+};
+SLIST_HEAD(authusers, authuser);
+
+
+struct mx_hostentry {
+	char		host[MAXDNAME];
+	char		addr[INET6_ADDRSTRLEN];
+	int		pref;
+	struct addrinfo	ai;
+	struct sockaddr_storage	sa;
+};
+
+struct smtp_auth_mechanisms {
+	int cram_md5;
+	int login;
+};
+
+struct smtp_features {
+	struct smtp_auth_mechanisms auth;
+	int starttls;
+};
+
+struct msg_hdr {
+	char from_addr[MSG_LINE_MAX];
+	char from_line[MSG_HDR_FROM_MAX];
+};
+
+/* global variables */
+extern struct aliases aliases;
+extern struct config config;
+extern struct strlist tmpfs;
+extern struct authusers authusers;
+extern char username[USERNAME_SIZE];
+extern uid_t useruid;
+extern const char *logident_base;
+
+extern char neterr[ERRMSG_SIZE];
+extern char errmsg[ERRMSG_SIZE];
+
+/* aliases_parse.y */
+int yyparse(void);
+int yywrap(void);
+int yylex(void);
+extern FILE *yyin;
+
+/* conf.c */
+void trim_line(char *);
+void parse_conf(const char *);
+void parse_authfile(const char *);
+
+/* crypto.c */
+void hmac_md5(unsigned char *, int, unsigned char *, int, unsigned char *);
+int smtp_auth_md5(int, char *, char *);
+int smtp_init_crypto(int, int, struct smtp_features*);
+int verify_server_fingerprint(const X509 *);
+
+/* dns.c */
+int dns_get_mx_list(const char *, int, struct mx_hostentry **, int);
+
+/* net.c */
+char *ssl_errstr(void);
+int read_remote(int, int, char *);
+ssize_t send_remote_command(int, const char*, ...)  __attribute__((__nonnull__(2), __format__ (__printf__, 2, 3)));
+int perform_server_greeting(int, struct smtp_features*);
+int deliver_remote(struct qitem *);
+
+/* base64.c */
+int base64_encode(const void *, int, char **);
+int base64_decode(const char *, void *);
+
+/* dma.c */
+#define EXPAND_ADDR	1
+#define EXPAND_WILDCARD	2
+int add_recp(struct msg_hdr *, struct queue *, const char *, int);
+void run_queue(struct queue *);
+
+/* spool.c */
+int newspoolf(struct queue *);
+int linkspool(struct queue *);
+int load_queue(struct queue *);
+void delqueue(struct qitem *);
+int acquirespool(struct qitem *);
+void dropspool(struct queue *, struct qitem *);
+int flushqueue_since(unsigned int);
+int flushqueue_signal(void);
+
+/* local.c */
+int deliver_local(struct qitem *);
+
+/* mail.c */
+void bounce(struct qitem *, const char *);
+int readmail(struct queue *, int, int);
+
+/* util.c */
+const char *hostname(void);
+void setlogident(const char *, ...) __attribute__((__format__ (__printf__, 1, 2)));
+void errlog(int, const char *, ...) __attribute__((__format__ (__printf__, 2, 3)));
+void errlogx(int, const char *, ...) __attribute__((__format__ (__printf__, 2, 3)));
+void set_username(void);
+void deltmp(void);
+int do_timeout(int, int);
+int open_locked(const char *, int, ...);
+char *rfc822date(void);
+int strprefixcmp(const char *, const char *);
+void init_random(void);
+
+#endif
