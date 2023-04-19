@@ -30,13 +30,14 @@
 	S_IWUSR	equ	00200q
 	S_IXUSR	equ	00100q
 
+	count	equ	10
 	newLine	db	LF, NULL
 	header	db	LF, "File Write Example."
 		db	LF, LF, NULL
-	fileName	db	"url.txt", NULL
-	url	db	"http://www.google.com"
-		db	LF, NULL
-	len	dq	$-url-1
+
+	fileName	db	"foo.txt", NULL
+	msg	db	0x00
+	len	dq	$-msg
 	writeDone	db	"Write Completed.", LF, NULL
 	fileDesc	dq	0
 	errMsgOpen	db	"Error opening file.", LF, NULL
@@ -60,7 +61,7 @@ openInputFile:
 
 	mov	rax, SYS_write
 	mov	rdi, qword [fileDesc]
-	mov	rsi, url
+	mov	rsi, msg
 	mov	rdx, qword [len] 
 	syscall
 
@@ -70,12 +71,35 @@ openInputFile:
 	mov	rdi, writeDone
 	call	printstring
 
+	mov	r8, count
+
+WriteLoop:
+
+	sub	r8, 1
+	jz	startClose
+	
+	mov	rax, SYS_write
+	mov	rdi, qword [fileDesc]
+	mov	rsi, msg
+	mov	rdx, qword [len]
+	syscall
+
+	cmp	rax, 0
+	jl	errorOnWrite
+
+	mov	rdi, writeDone
+	call	printstring
+
+	add	WORD [msg], 1
+	jmp	WriteLoop
+
+startClose:	
 	mov	rax, SYS_close
 	mov	rdi, qword [fileDesc]
 	syscall
 
 	jmp	exampleDone
-
+	
 errorOnOpen:
 	mov	rdi, errMsgOpen
 	call	printstring
@@ -92,7 +116,6 @@ exampleDone:
 	mov	rax, SYS_exit
 	mov	rdi, EXIT_SUCCESS
 	syscall
-
 
 	global printstring
 
